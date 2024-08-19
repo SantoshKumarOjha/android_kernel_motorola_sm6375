@@ -2,6 +2,7 @@
 /*
  * Copyright (C) 2018 HUAWEI, Inc.
  *             https://www.huawei.com/
+ * Created by Gao Xiang <gaoxiang25@huawei.com>
  */
 #include "zdata.h"
 #include "compress.h"
@@ -144,6 +145,7 @@ static void erofs_destroy_percpu_workers(void)
 
 static struct kthread_worker *erofs_init_percpu_worker(int cpu)
 {
+
 	struct kthread_worker *worker =
 		kthread_create_worker_on_cpu(cpu, 0, "erofs_worker/%u", cpu);
 
@@ -153,6 +155,7 @@ static struct kthread_worker *erofs_init_percpu_worker(int cpu)
 		sched_set_fifo_low(worker->task);
 	else
 		sched_set_normal(worker->task, 0);
+
 	return worker;
 }
 
@@ -278,6 +281,7 @@ out_error_pcpu_worker:
 out_error_workqueue_init:
 	z_erofs_destroy_pcluster_pool();
 out_error_pcluster_pool:
+
 	return err;
 }
 
@@ -341,6 +345,7 @@ struct z_erofs_decompress_frontend {
 	struct z_erofs_collector clt;
 	struct erofs_map_blocks map;
 
+	bool readahead;
 	/* used for applying cache strategy on the fly */
 	bool backmost;
 	erofs_off_t headoffset;
@@ -920,6 +925,9 @@ static void z_erofs_decompress_kickoff(struct z_erofs_decompressqueue *io,
 
 	/* wake up the caller thread for sync decompression */
 	if (sync) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&io->u.wait.lock, flags);
 		if (!atomic_add_return(bios, &io->pending_bios))
 			complete(&io->u.done);
 
@@ -1362,7 +1370,7 @@ jobqueue_init(struct super_block *sb,
 	} else {
 fg_out:
 		q = fgq;
-		init_completion(&fgq->u.done);
+		init_waitqueue_head(&fgq->u.wait);
 		atomic_set(&fgq->pending_bios, 0);
 	}
 	q->sb = sb;
@@ -1411,7 +1419,7 @@ static void move_to_bypass_jobqueue(struct z_erofs_pcluster *pcl,
 }
 
 static void z_erofs_submit_queue(struct super_block *sb,
-				 z_erofs_next_pcluster_t owned_head,
+				 struct z_erofs_decompress_frontend *f,
 				 struct list_head *pagepool,
 				 struct z_erofs_decompressqueue *fgq,
 				 bool *force_fg)
@@ -1420,6 +1428,7 @@ static void z_erofs_submit_queue(struct super_block *sb,
 	z_erofs_next_pcluster_t qtail[NR_JOBQUEUES];
 	struct z_erofs_decompressqueue *q[NR_JOBQUEUES];
 	void *bi_private;
+	z_erofs_next_pcluster_t owned_head = f->clt.owned_head;
 	/* since bio will be NULL, no need to initialize last_index */
 	pgoff_t last_index;
 	unsigned int nr_bios = 0;
@@ -1475,6 +1484,8 @@ submit_bio_retry:
 					LOG_SECTORS_PER_BLOCK;
 				bio->bi_private = bi_private;
 				bio->bi_opf = REQ_OP_READ;
+				if (f->readahead)
+					bio->bi_opf |= REQ_RAHEAD;
 				++nr_bios;
 			}
 
@@ -1506,14 +1517,14 @@ submit_bio_retry:
 }
 
 static void z_erofs_runqueue(struct super_block *sb,
-			     struct z_erofs_collector *clt,
+			     struct z_erofs_decompress_frontend *f,
 			     struct list_head *pagepool, bool force_fg)
 {
 	struct z_erofs_decompressqueue io[NR_JOBQUEUES];
 
-	if (clt->owned_head == Z_EROFS_PCLUSTER_TAIL)
+	if (f->clt.owned_head == Z_EROFS_PCLUSTER_TAIL)
 		return;
-	z_erofs_submit_queue(sb, clt->owned_head, pagepool, io, &force_fg);
+	z_erofs_submit_queue(sb, f, pagepool, io, &force_fg);
 
 	/* handle bypass queue (no i/o pclusters) immediately */
 	z_erofs_decompress_queue(&io[JQ_BYPASS], pagepool);
@@ -1522,7 +1533,8 @@ static void z_erofs_runqueue(struct super_block *sb,
 		return;
 
 	/* wait until all bios are completed */
-	wait_for_completion_io(&io[JQ_SUBMIT].u.done);
+	io_wait_event(io[JQ_SUBMIT].u.wait,
+		      !atomic_read(&io[JQ_SUBMIT].pending_bios));
 
 	/* handle synchronous decompress queue in the caller context */
 	z_erofs_decompress_queue(&io[JQ_SUBMIT], pagepool);
@@ -1543,7 +1555,7 @@ static int z_erofs_readpage(struct file *file, struct page *page)
 	(void)z_erofs_collector_end(&f.clt);
 
 	/* if some compressed cluster ready, need submit them anyway */
-	z_erofs_runqueue(inode->i_sb, &f.clt, &pagepool, true);
+	z_erofs_runqueue(inode->i_sb, &f, &pagepool, true);
 
 	if (err)
 		erofs_err(inode->i_sb, "failed to read, err [%d]", err);
@@ -1556,8 +1568,16 @@ static int z_erofs_readpage(struct file *file, struct page *page)
 	return err;
 }
 
-static int z_erofs_readpages(struct file *filp, struct address_space *mapping,
-			     struct list_head *pages, unsigned int nr_pages)
+static bool should_decompress_synchronously(struct erofs_sb_info *sbi,
+					    unsigned int nr)
+{
+	return nr <= 3;
+}
+
+static int z_erofs_vle_normalaccess_readpages(struct file *filp,
+					      struct address_space *mapping,
+					      struct list_head *pages,
+					      unsigned int nr_pages)
 {
 	struct inode *const inode = mapping->host;
 	struct erofs_sb_info *const sbi = EROFS_I_SB(inode);
@@ -1613,7 +1633,7 @@ static int z_erofs_readpages(struct file *filp, struct address_space *mapping,
 
 	(void)z_erofs_collector_end(&f.clt);
 
-	z_erofs_runqueue(inode->i_sb, &f.clt, &pagepool, sync);
+	z_erofs_runqueue(inode->i_sb, &f, &pagepool, sync);
 
 	if (f.map.mpage)
 		put_page(f.map.mpage);
@@ -1623,7 +1643,8 @@ static int z_erofs_readpages(struct file *filp, struct address_space *mapping,
 	return 0;
 }
 
+
 const struct address_space_operations z_erofs_aops = {
 	.readpage = z_erofs_readpage,
-	.readpages = z_erofs_readpages,
+	.readpages = z_erofs_vle_normalaccess_readpages,
 };

@@ -2,6 +2,7 @@
 /*
  * Copyright (C) 2017-2018 HUAWEI, Inc.
  *             https://www.huawei.com/
+ * Created by Gao Xiang <gaoxiang25@huawei.com>
  */
 #include "internal.h"
 #include <linux/prefetch.h>
@@ -208,7 +209,7 @@ submit_bio_retry:
 		bio_set_dev(bio, sb->s_bdev);
 		bio->bi_iter.bi_sector = (sector_t)blknr <<
 			LOG_SECTORS_PER_BLOCK;
-		bio->bi_opf = REQ_OP_READ;
+		bio->bi_opf = REQ_OP_READ | (ra ? REQ_RAHEAD : 0);
 	}
 
 	err = bio_add_page(bio, page, PAGE_SIZE, 0);
