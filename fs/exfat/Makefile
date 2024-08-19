@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Makefile for the linux exFAT filesystem support.
@@ -38,3 +39,14 @@ uninstall:
 endif
 
 .PHONY : all clean install uninstall
+
+KERNEL_SRC ?= /lib/modules/$(shell uname -r)/build
+
+all:
+	$(MAKE) -C $(KERNEL_SRC) M=$(shell pwd) modules $(KBUILD_OPTIONS)
+
+modules_install:
+	$(MAKE) INSTALL_MOD_STRIP=1 -C $(KERNEL_SRC) M=$(shell pwd) modules_install
+
+clean:
+	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) clean
