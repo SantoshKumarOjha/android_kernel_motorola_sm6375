@@ -247,6 +247,7 @@ static int q6lsm_callback(struct apr_client_data *data, void *priv)
 			ret = -EINVAL;
 			goto done;
 		}
+
 		memcpy((u8 *)client->get_param_payload,
 			(u8 *)payload + payload_min_size_expected, param_size);
 done:
@@ -538,6 +539,7 @@ static int q6lsm_apr_send_pkt(struct lsm_client *client, void *handle,
 	if (wait)
 		mutex_unlock(&lsm_common.apr_lock);
 
+	mmap_handle_p = NULL;
 	if (mmap_p && *mmap_p == 0)
 		ret = -ENOMEM;
 	mmap_handle_p = NULL;
